@@ -164,7 +164,7 @@ wheels = [
 ]
 
 [[package]]
-name = "web2pdf"
+name = "reader2pdf"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
