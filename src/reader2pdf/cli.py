@@ -9,17 +9,19 @@ from pathlib import Path
 from .constants import DEFAULT_TIMEOUT_S
 from .utils import read_url_lines, sha256_hex
 from .browser_async import launch_browser, close_browser, render_url_to_pdf_async
+from rich.console import Group
 from rich.live import Live
+from rich.panel import Panel
 from rich.progress import (
     Progress,
     BarColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
+    TaskProgressColumn,
     MofNCompleteColumn,
-    SpinnerColumn,
 )
-from rich.table import Table
+
 
 app = typer.Typer(add_completion=False)
 
@@ -32,9 +34,10 @@ async def _worker(
     timeout_s: int,
     retries: int,
     echo: Callable[[str], None],
+    event_q: asyncio.Queue,
 ) -> None:
     """
-    Worker coroutine to render a single URL to PDF with retries and semaphore control.
+    Worker task that processes a single URL with retries and concurrency control.
     """
     attempt = 0
     while True:
@@ -42,14 +45,16 @@ async def _worker(
         async with sem:
             try:
                 await render_url_to_pdf_async(ctx, url, pdf_path, timeout_s)
-                # echo(f"    [ok] {url}")
+                # NOTE: report success
+                await event_q.put(("ok", url, None))
                 return
-            except Exception as _:
+            except Exception as exc:
                 if attempt <= retries + 1:
                     # echo(f"    [!] retry {attempt - 1}/{retries} after error: {exc}")
-                    await asyncio.sleep(min(2 * attempt, 5))  # tiny backoff
+                    await asyncio.sleep(min(2 * attempt, 5))
                 else:
-                    # echo(f"    [x] Failed after {retries} retries: {exc}")
+                    # final failure counts as "processed" too
+                    await event_q.put(("fail", url, str(exc)))
                     return
 
 
@@ -84,76 +89,90 @@ async def _run_async(
     max_concurrency: int,
     retries: int,
 ) -> None:
+    """
+    Main async runner.
+    """
     urls = read_url_lines(url_file)
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    # NOTE: Rich progress bar setup
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold]Overall"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        MofNCompleteColumn(),  # "200/400"
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        transient=False,  # keep bar after finish
-    )
-    now_tbl = Table(show_edge=False, box=None)
-    now_tbl.add_column("Now processing", style="cyan", no_wrap=True)
-
-    def render_now(items: list[str]) -> Table:
-        """
-        Render the "Now processing" table, while preserving layout.
-        """
-        tbl = Table(show_edge=False, box=None)
-        tbl.add_column("Now processing", style="cyan", no_wrap=True)
-        for it in items:
-            tbl.add_row(it)
-        return tbl
 
     browser, ctx = await launch_browser()
     try:
         sem = asyncio.Semaphore(max(1, max_concurrency))
+
+        # NOTE: UI widgets
         total = len(urls)
-        in_flight: list[str] = []
+        processed_lines: list[str] = []
 
-        # NOTE: Using Live to manage dynamic display of progress + current tasks
-        with Live(progress, refresh_per_second=8, transient=False) as live:
-            # Add a second panel under the bar that we update the "current processing" list
-            task_id = progress.add_task("overall", total=total)
+        progress = Progress(
+            TextColumn("[bold]Overall job status[/bold]"),
+            BarColumn(),
+            TaskProgressColumn(),  # shows percentage like "50%"
+            TextColumn("•"),
+            MofNCompleteColumn(),  # "200/400"
+            TextColumn("URLs processed"),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn(" ETA "),
+            TimeRemainingColumn(),
+            expand=True,
+        )
+        task_id = progress.add_task("render", total=total)
 
-            async def run_one(url: str, idx: int) -> None:
-                """
-                Run one URL processing task, updating progress and live display.
-                """
-                label = f"{idx + 1}/{total} {url}"
-                in_flight.append(label)
-                # swap Live's renderable: progress + the table
-                live.update(renderable=progress)  # ensure progress stays visible
-                live.console.print()  # spacer above table (optional)
-                live.console.print(render_now(in_flight))
+        def _render_ui() -> Group:
+            """
+            Render the live UI panel.
+            """
+            # newest entries will naturally appear at the bottom as we append
+            body = (
+                "\n".join(processed_lines)
+                if processed_lines
+                else "[dim]No URLs processed yet...[/dim]"
+            )
+            return Group(
+                progress,
+                Panel(
+                    body, title="Processed URLs", border_style="green", padding=(1, 1)
+                ),
+            )
 
-                try:
-                    await _worker(
-                        sem,
-                        ctx,
-                        url,
-                        out_dir / f"{sha256_hex(url)}.pdf",
-                        timeout_s,
-                        retries,
-                        lambda s: live.console.log(s),
-                    )
-                finally:
-                    # remove from "now processing", advance bar
-                    if label in in_flight:
-                        in_flight.remove(label)
-                    progress.advance(task_id)
-                    # refresh the table view
-                    live.console.print(render_now(in_flight))
+        # event queue for workers -> UI
+        event_q: asyncio.Queue = asyncio.Queue()
 
-            await asyncio.gather(*(run_one(url, i) for i, url in enumerate(urls)))
+        # launch workers
+        tasks = []
+        for url in urls:
+            pdf_path = out_dir / f"{sha256_hex(url)}.pdf"
+            # typer.echo(f"[+] {url} -> {pdf_path}")
+            tasks.append(
+                _worker(
+                    sem, ctx, url, pdf_path, timeout_s, retries, typer.echo, event_q
+                )
+            )
 
-            progress.update(task_id, advance=0)  # final paint
+        # run workers and UI together
+        async def ui_loop() -> None:
+            """
+            UI loop that updates the live display based on events from workers.
+            """
+            completed = 0
+            # drive the live display
+            with Live(_render_ui(), refresh_per_second=8, transient=False) as live:
+                with progress:
+                    while completed < total:
+                        status, url, err = await event_q.get()
+                        completed += 1
+                        progress.update(task_id, advance=1)
+
+                        if status == "ok":
+                            processed_lines.append(f"[green]✓[/green] {url}")
+                        else:
+                            processed_lines.append(
+                                f"[red]✗[/red] {url}  [dim]{err}[/dim]"
+                            )
+
+                        live.update(_render_ui())
+
+        await asyncio.gather(asyncio.create_task(ui_loop()), *tasks)
 
     finally:
         await close_browser(browser, ctx)
