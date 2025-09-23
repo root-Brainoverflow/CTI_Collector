@@ -3,15 +3,46 @@
 from __future__ import annotations
 
 import typer
+import asyncio
+from typing import Callable
 from pathlib import Path
 from .constants import DEFAULT_TIMEOUT_S
 from .utils import read_url_lines, sha256_hex
-from .browser import render_url_to_pdf
+from .browser_async import launch_browser, close_browser, render_url_to_pdf_async
 
 app = typer.Typer(add_completion=False)
 
 
-@app.command(help="Process URLs line-by-line, save PDFs as sha256(url).pdf")
+async def _worker(
+    sem: asyncio.Semaphore,
+    ctx,
+    url: str,
+    pdf_path: Path,
+    timeout_s: int,
+    retries: int,
+    echo: Callable[[str], None],
+) -> None:
+    """
+    Worker coroutine to render a single URL to PDF with retries and semaphore control.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        async with sem:
+            try:
+                await render_url_to_pdf_async(ctx, url, pdf_path, timeout_s)
+                echo(f"    [ok] {url}")
+                return
+            except Exception as exc:
+                if attempt <= retries + 1:
+                    echo(f"    [!] retry {attempt - 1}/{retries} after error: {exc}")
+                    await asyncio.sleep(min(2 * attempt, 5))  # tiny backoff
+                else:
+                    echo(f"    [x] Failed after {retries} retries: {exc}")
+                    return
+
+
+@app.command(help="Process URLs concurrently, save PDFs as sha256(url).pdf")
 def run(
     url_file: Path = typer.Option(
         ..., "--url-file", "-i", help="Text file with one URL per line"
@@ -22,18 +53,44 @@ def run(
     timeout_s: int = typer.Option(
         DEFAULT_TIMEOUT_S, help="Per-URL navigation timeout (seconds)"
     ),
+    max_concurrency: int = typer.Option(
+        6, "--max-concurrency", "-c", help="Max concurrent pages"
+    ),
+    retries: int = typer.Option(
+        1, "--retries", "-r", help="Retries per URL on failure"
+    ),
+) -> None:
+    """
+    Thin sync wrapper that runs the async pipeline.
+    """
+    asyncio.run(_run_async(url_file, out_dir, timeout_s, max_concurrency, retries))
+
+
+async def _run_async(
+    url_file: Path,
+    out_dir: Path,
+    timeout_s: int,
+    max_concurrency: int,
+    retries: int,
 ) -> None:
     urls = read_url_lines(url_file)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Sequentially process each URL
-    for url in urls:
-        pdf_path = out_dir / f"{sha256_hex(url)}.pdf"
-        typer.echo(f"[+] {url} -> {pdf_path}")
-        try:
-            render_url_to_pdf(url, pdf_path, timeout_s)
-        except Exception as exc:
-            typer.echo(f"    [x] Failed: {exc}")
+    browser, ctx = await launch_browser()
+    try:
+        sem = asyncio.Semaphore(max(1, max_concurrency))
+        tasks = []
+        for url in urls:
+            pdf_path = out_dir / f"{sha256_hex(url)}.pdf"
+            typer.echo(f"[+] {url} -> {pdf_path}")
+            tasks.append(
+                _worker(sem, ctx, url, pdf_path, timeout_s, retries, typer.echo)
+            )
+
+        # Run all workers concurrently
+        await asyncio.gather(*tasks)
+    finally:
+        await close_browser(browser, ctx)
 
 
 @app.command(help="Install Chromium browser for Playwright (one-time).")
