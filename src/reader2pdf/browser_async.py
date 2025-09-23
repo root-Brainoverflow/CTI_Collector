@@ -22,7 +22,12 @@ async def launch_browser() -> tuple[Browser, BrowserContext]:
     Launch Chromium and create a context suitable for concurrent pages.
     """
     p = await async_playwright().start()
-    browser = await p.chromium.launch(headless=True)
+    browser = await p.chromium.launch(
+        headless=True,
+        args=[
+            "--disable-features=LazyImageLoading,LazyFrameLoading"
+        ],  # Force lazy loading to be off
+    )
     ctx = await browser.new_context(
         viewport=VIEWPORT,  # type: ignore[arg-type]
         java_script_enabled=True,
@@ -86,6 +91,45 @@ async def _readerize_in_sandbox(ctx: BrowserContext, url: str, html: str) -> Pag
             source_url=url,
         )
         await proc.set_content(clean, wait_until="load")
+
+        # Make images eager, trigger loading, and wait for decode before printing
+        await proc.evaluate(
+            """
+            (async () => {
+              // 1) De-lazy images
+              for (const img of document.querySelectorAll('img')) {
+                try {
+                  // Make sure the browser fetches them now
+                  img.loading = 'eager';
+                  img.decoding = 'sync';
+                  // Common lazy patterns we might still see even after Readability:
+                  if (!img.getAttribute('src')) {
+                    const ds = img.getAttribute('data-src') || img.getAttribute('data-original') || img.getAttribute('data-url');
+                    if (ds) img.setAttribute('src', ds);
+                  }
+                } catch {}
+              }
+
+              // 2) Nudge viewport so intersection/viewport-based lazy-loaders fire
+              window.scrollTo(0, document.body.scrollHeight);
+              await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+              window.scrollTo(0, 0);
+
+              // 3) Wait for all images to finish loading/decoding
+              const imgs = Array.from(document.images);
+              await Promise.all(imgs.map(img => {
+                if (img.complete && img.naturalWidth > 0) return Promise.resolve();
+                return (img.decode ? img.decode() : Promise.resolve()).catch(() => {});
+              }));
+            })();
+            """
+        )
+
+        # Optional: also wait for any last network fetches
+        try:
+            await proc.wait_for_load_state("networkidle", timeout=10_000)
+        except PWTimeoutError:
+            pass
 
     # else: fall back to the empty sandbox page; PDF will still be produced
     return proc
