@@ -9,7 +9,7 @@ from pathlib import Path
 from .constants import DEFAULT_TIMEOUT_S
 from .utils import read_url_lines, sha256_hex
 from .browser_async import launch_browser, close_browser, render_url_to_pdf_async
-from rich.console import Group
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
@@ -24,6 +24,8 @@ from rich.progress import (
 
 
 app = typer.Typer(add_completion=False)
+
+console = Console()
 
 
 async def _worker(
@@ -101,15 +103,15 @@ async def _run_async(
 
         # NOTE: UI widgets
         total = len(urls)
-        processed_lines: list[str] = []
+        processed_lines: list[str] = []  # we’ll store ALL; we’ll render only the tail
 
         progress = Progress(
-            TextColumn("[bold]Overall job status[/bold]"),
+            TextColumn("[bold]Overall[/bold]"),
             BarColumn(),
-            TaskProgressColumn(),  # shows percentage like "50%"
+            TaskProgressColumn(),  # "50%"
             TextColumn("•"),
             MofNCompleteColumn(),  # "200/400"
-            TextColumn("URLs processed"),
+            TextColumn("processed"),
             TextColumn("•"),
             TimeElapsedColumn(),
             TextColumn(" ETA "),
@@ -118,21 +120,37 @@ async def _run_async(
         )
         task_id = progress.add_task("render", total=total)
 
-        def _render_ui() -> Group:
-            """
-            Render the live UI panel.
-            """
-            # newest entries will naturally appear at the bottom as we append
+        def _render_ui():
+            # compute how many lines can fit above the progress bar
+            # leave some rows for borders/title and the progress bar itself
+            h = console.size.height
+            reserved_rows = 7  # ~2 for panel borders/title, ~3-4 for progress + spacing
+            tail_cap = max(3, h - reserved_rows)
+
+            # take the tail that fits, and show an ellipsis count if older lines exist
+            over = max(0, len(processed_lines) - tail_cap)
+            tail = processed_lines[-tail_cap:] if processed_lines else []
+            if over > 0:
+                head = f"[dim]… {over} older processed entries hidden …[/dim]"
+                body_lines = [head, *tail]
+            else:
+                body_lines = tail
+
             body = (
-                "\n".join(processed_lines)
-                if processed_lines
+                "\n".join(body_lines)
+                if body_lines
                 else "[dim]No URLs processed yet...[/dim]"
             )
+
+            # IMPORTANT: progress last => stays at the bottom
             return Group(
-                progress,
                 Panel(
-                    body, title="Processed URLs", border_style="green", padding=(1, 1)
+                    body,
+                    title="Processed (latest at bottom)",
+                    border_style="green",
+                    padding=(0, 1),
                 ),
+                progress,
             )
 
         # event queue for workers -> UI
@@ -155,9 +173,10 @@ async def _run_async(
             UI loop that updates the live display based on events from workers.
             """
             completed = 0
-            # drive the live display
-            with Live(_render_ui(), refresh_per_second=8, transient=False) as live:
-                with progress:
+
+            try:
+                # Drive the live display (which renders the Panel + progress)
+                with Live(_render_ui(), refresh_per_second=8, transient=False) as live:
                     while completed < total:
                         status, url, err = await event_q.get()
                         completed += 1
@@ -170,7 +189,10 @@ async def _run_async(
                                 f"[red]✗[/red] {url}  [dim]{err}[/dim]"
                             )
 
+                        # Re-render tail + progress at the bottom
                         live.update(_render_ui())
+            finally:
+                pass
 
         await asyncio.gather(asyncio.create_task(ui_loop()), *tasks)
 
