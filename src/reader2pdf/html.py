@@ -5,20 +5,53 @@ import time
 from typing import Final
 from .constants import MINIMAL_CSS
 
-# Minimal HTML template for rendering articles
-_HTML_HEAD: Final[str] = f"""<!DOCTYPE html>
-<html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<style>{MINIMAL_CSS}</style>"""
+# Additional CSS to make tables look good in printed (PDF) output
+TABLE_CSS: Final[str] = """
+/* Print-friendly tables */
+article table { width: 100%; border-collapse: collapse; margin: 1.25rem 0; page-break-inside: auto; }
+article thead { display: table-header-group; }   /* Repeat header on page breaks */
+article tfoot { display: table-footer-group; }
+article tr { break-inside: avoid; page-break-inside: avoid; }
+article th, article td { border: 1px solid #ccc; padding: 6px 8px; vertical-align: top; text-align: left; }
+article th { font-weight: 600; background: #fafafa; }
+article caption { caption-side: top; font-weight: 600; text-align: left; margin-bottom: .5rem; }
 
+/* Ensure wide tables wrap properly */
+article table { table-layout: fixed; }
+article th, article td { word-break: break-word; }
+
+/* Remove link tails in print (delete if not needed) */
+@media print {
+  a[href]:after { content: none !important; }
+}
+"""
+
+# Combine base CSS with table-specific CSS
+COMBINED_CSS: Final[str] = f"{MINIMAL_CSS}\n{TABLE_CSS}"
 
 def render_article_html(title: str, content_html: str, source_url: str) -> str:
     """
     Render the article content into a complete HTML document.
+    - Renders the body, including tables (<table>), to look good in PDF output.
+    - Adds <base href> to ensure relative paths (e.g., images/links inside table cells) are resolved correctly.
     """
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    return (
-        f"{_HTML_HEAD}"
+
+    # Dynamically create the head section, including <base> and combined CSS
+    html_head = (
+        "<!DOCTYPE html>"
+        "<html>"
+        "<head>"
+        '<meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<base href="{source_url}">'         # Resolves relative resources (including images/links in table cells)
+        f"<style>{COMBINED_CSS}</style>"
         f"<title>{title}</title>"
+        "</head>"
+    )
+
+    return (
+        f"{html_head}"
         f"<body>"
         f'<header>Source: <a href="{source_url}">{source_url}</a></header>'
         f"<h1>{title}</h1>"
