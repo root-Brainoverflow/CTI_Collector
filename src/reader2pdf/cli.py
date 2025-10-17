@@ -6,6 +6,8 @@ import typer
 import asyncio
 from typing import Callable
 from pathlib import Path
+import re
+import os
 from .constants import DEFAULT_TIMEOUT_S
 from .utils import read_url_lines, sha256_hex
 from .browser_async import launch_browser, close_browser, render_url_to_pdf_async
@@ -28,11 +30,38 @@ app = typer.Typer(add_completion=False)
 console = Console()
 
 
+def sanitize_filename(title: str) -> str:
+    """
+    제목을 안전한 파일명으로 변환합니다.
+    """
+    # 불법 문자 제거 및 공백을 언더스코어로 변경
+    sanitized = re.sub(r'[<>:"/\\|?*]', '', title)
+    sanitized = re.sub(r'\s+', '_', sanitized.strip())
+    # 파일명 길이 제한 (확장자 제외 최대 200자)
+    if len(sanitized) > 200:
+        sanitized = sanitized[:200]
+    return sanitized if sanitized else "untitled"
+
+
+async def get_page_title(ctx, url: str) -> str:
+    """
+    페이지의 제목을 추출합니다.
+    """
+    try:
+        page = await ctx.new_page()
+        await page.goto(url, timeout=30000)
+        title = await page.title()
+        await page.close()
+        return title.strip() if title else "untitled"
+    except Exception:
+        return "untitled"
+
+
 async def _worker(
     sem: asyncio.Semaphore,
     ctx,
     url: str,
-    pdf_path: Path,
+    out_dir: Path,
     timeout_s: int,
     retries: int,
     echo: Callable[[str], None],
@@ -42,17 +71,38 @@ async def _worker(
     Worker task that processes a single URL with retries and concurrency control.
     """
     attempt = 0
+    temp_pdf_path = out_dir / f"temp_{sha256_hex(url)}.pdf"
+
     while True:
         attempt += 1
         async with sem:
             try:
-                await render_url_to_pdf_async(ctx, url, pdf_path, timeout_s)
+                # PDF 생성
+                await render_url_to_pdf_async(ctx, url, temp_pdf_path, timeout_s)
+
+                # 페이지 제목 추출
+                title = await get_page_title(ctx, url)
+                safe_title = sanitize_filename(title)
+
+                # 최종 파일명 생성 (중복 방지)
+                final_pdf_path = out_dir / f"{safe_title}.pdf"
+                counter = 1
+                while final_pdf_path.exists():
+                    final_pdf_path = out_dir / f"{safe_title}_{counter}.pdf"
+                    counter += 1
+
+                # 임시 파일을 최종 파일명으로 이동
+                os.rename(temp_pdf_path, final_pdf_path)
+
                 # NOTE: report success
-                await event_q.put(("ok", url, None))
+                await event_q.put(("ok", url, str(final_pdf_path.name)))
                 return
             except Exception as exc:
+                # 임시 파일 정리
+                if temp_pdf_path.exists():
+                    temp_pdf_path.unlink()
+
                 if attempt <= retries + 1:
-                    # echo(f"    [!] retry {attempt - 1}/{retries} after error: {exc}")
                     await asyncio.sleep(min(2 * attempt, 5))
                 else:
                     # final failure counts as "processed" too
@@ -159,11 +209,10 @@ async def _run_async(
         # launch workers
         tasks = []
         for url in urls:
-            pdf_path = out_dir / f"{sha256_hex(url)}.pdf"
-            # typer.echo(f"[+] {url} -> {pdf_path}")
+            # PDF 경로는 worker 내에서 결정되도록 변경
             tasks.append(
                 _worker(
-                    sem, ctx, url, pdf_path, timeout_s, retries, typer.echo, event_q
+                    sem, ctx, url, out_dir, timeout_s, retries, typer.echo, event_q
                 )
             )
 
@@ -178,7 +227,7 @@ async def _run_async(
                 # Drive the live display (which renders the Panel + progress)
                 with Live(_render_ui(), refresh_per_second=8, transient=False) as live:
                     while completed < total:
-                        status, url, err = await event_q.get()
+                        status, url, result = await event_q.get()
                         completed += 1
                         progress.update(task_id, advance=1)
 
@@ -186,7 +235,7 @@ async def _run_async(
                             processed_lines.append(f"[green]✓[/green] {url}")
                         else:
                             processed_lines.append(
-                                f"[red]✗[/red] {url}  [dim]{err}[/dim]"
+                                f"[red]✗[/red] {url}  [dim]{result}[/dim]"
                             )
 
                         # Re-render tail + progress at the bottom
